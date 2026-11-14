@@ -94,8 +94,29 @@
                         </div>
                     </div>
 
+                    <!-- Mode Selector -->
+                    <div class="mt-4 p-3 rounded-xl bg-[#FAF6F0] border border-[#E5DCCB]">
+                        <label class="block text-xs font-semibold text-stone-700 mb-2">Chế độ xử lý (Tối ưu RAM):</label>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <label class="flex items-start space-x-2 p-2.5 rounded-lg border border-[#D8CBB8] bg-white/70 cursor-pointer hover:border-amber-600 transition">
+                                <input type="radio" name="runMode" value="direct" checked class="mt-0.5 accent-amber-700">
+                                <div>
+                                    <div class="text-xs font-bold text-stone-800">Siêu nhẹ (~220MB RAM)</div>
+                                    <div class="text-[11px] text-stone-500">Chạy tức thì &lt;0.5s, không sập RAM</div>
+                                </div>
+                            </label>
+                            <label class="flex items-start space-x-2 p-2.5 rounded-lg border border-[#D8CBB8] bg-white/70 cursor-pointer hover:border-amber-600 transition">
+                                <input type="radio" name="runMode" value="dire" class="mt-0.5 accent-amber-700">
+                                <div>
+                                    <div class="text-xs font-bold text-stone-800">Full 2-Step DIRE</div>
+                                    <div class="text-[11px] text-stone-500">Tạo ảnh tái tạo + DIRE (~1.5GB RAM tạm)</div>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
                     <!-- Predict Button -->
-                    <button id="predictBtn" disabled class="mt-5 w-full py-3.5 px-4 rounded-xl font-semibold text-sm transition-all duration-200 bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-amber-900/15 flex items-center justify-center space-x-2">
+                    <button id="predictBtn" disabled class="mt-4 w-full py-3.5 px-4 rounded-xl font-semibold text-sm transition-all duration-200 bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-amber-900/15 flex items-center justify-center space-x-2">
                         <span id="btnText">Phân Tích Ảnh (Full DIRE)</span>
                         <svg id="btnSpinner" class="hidden animate-spin w-5 h-5 text-white" fill="none" viewBox="0 0 24 24">
                             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
@@ -344,9 +365,11 @@
         predictBtn.addEventListener('click', async () => {
             if (!selectedFile) return;
 
-            setLoading(true);
+            const selectedMode = document.querySelector('input[name="runMode"]:checked')?.value || 'direct';
+            setLoading(true, selectedMode);
             const formData = new FormData();
             formData.append('file', selectedFile);
+            formData.append('mode', selectedMode);
 
             try {
                 const response = await fetch('/api/predict', {
@@ -368,13 +391,14 @@
 
         // Test with preloaded samples
         async function testSample(sampleName) {
-            setLoading(true);
+            const selectedMode = document.querySelector('input[name="runMode"]:checked')?.value || 'direct';
+            setLoading(true, sampleName === 'dire' ? 'direct' : selectedMode);
             try {
                 imagePreview.src = `/api/sample_image/${sampleName}?t=${Date.now()}`;
                 uploadPrompt.classList.add('hidden');
                 previewContainer.classList.remove('hidden');
 
-                const response = await fetch(`/api/sample/${sampleName}`);
+                const response = await fetch(`/api/sample/${sampleName}?mode=${selectedMode}`);
                 const data = await response.json();
                 if (data.success) {
                     renderResult(data.result);
@@ -388,14 +412,16 @@
             }
         }
 
-        function setLoading(isLoading) {
+        function setLoading(isLoading, mode = 'direct') {
             predictBtn.disabled = isLoading;
             if (isLoading) {
-                btnText.textContent = 'Đang tính DIRE & phân tích...';
+                btnText.textContent = mode === 'dire' ? 'Đang tính DIRE & phân tích...' : 'Đang phân tích nhanh...';
                 btnSpinner.classList.remove('hidden');
-                loadingHint.classList.remove('hidden');
+                if (mode === 'dire') {
+                    loadingHint.classList.remove('hidden');
+                }
             } else {
-                btnText.textContent = 'Phân Tích Ảnh (Full DIRE)';
+                btnText.textContent = 'Phân Tích Ảnh';
                 btnSpinner.classList.add('hidden');
                 loadingHint.classList.add('hidden');
             }
