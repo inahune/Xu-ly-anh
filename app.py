@@ -1,5 +1,9 @@
 import os
 import sys
+import gc
+import io
+import pickle
+import zipfile
 import base64
 import time
 from io import BytesIO
@@ -42,6 +46,11 @@ app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # Toi da 32MB
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CLASSIFIER_PATH = os.path.join(BASE_DIR, "checkpoints", "lsun_adm.pth")
 DIFFUSION_PATH = os.path.join(BASE_DIR, "checkpoints", "256x256_diffusion_uncond.pt")
+DIFFUSION_BF16_PATH = os.path.join(BASE_DIR, "checkpoints", "256x256_diffusion_uncond_bf16.pt")
+
+# Cau hinh toi uu theo phan cung (CPU dung 64x64 ddim5 bfloat16 de tranh tran RAM & chay muot)
+DIFF_RES = 256 if DEVICE == "cuda" else 64
+DIFF_STEPS = "ddim20" if DEVICE == "cuda" else "ddim5"
 
 # ---------------------------------------------------------
 # 1. Khoi tao Classifier (ResNet-50)
@@ -51,13 +60,14 @@ if os.path.exists(CLASSIFIER_PATH):
     try:
         with torch.device("meta"):
             classifier_model = get_network("resnet50")
-        state_dict = torch.load(CLASSIFIER_PATH, map_location="cpu", mmap=True, weights_only=False)
+        state_dict = torch.load(CLASSIFIER_PATH, map_location="cpu", weights_only=False)
         if "model" in state_dict:
             state_dict = state_dict["model"]
         classifier_model.load_state_dict(state_dict, assign=True)
+        del state_dict
     except Exception:
         classifier_model = get_network("resnet50")
-        state_dict = torch.load(CLASSIFIER_PATH, map_location="cpu", mmap=True, weights_only=False)
+        state_dict = torch.load(CLASSIFIER_PATH, map_location="cpu", weights_only=False)
         if "model" in state_dict:
             state_dict = state_dict["model"]
         classifier_model.load_state_dict(state_dict)
@@ -71,7 +81,83 @@ else:
     print(f"[!] Canh bao: Khong tim thay checkpoint Classifier tai {CLASSIFIER_PATH}")
 
 # ---------------------------------------------------------
-# 2. Khoi tao Diffusion Model (256x256 ADM) neu da co file
+# 2. Chuyen doi sang bfloat16 neu chay CPU & chua co file bf16
+# ---------------------------------------------------------
+def ensure_bf16_checkpoint():
+    if os.path.exists(DIFFUSION_BF16_PATH) and os.path.getsize(DIFFUSION_BF16_PATH) > 1_000_000_000:
+        return True
+    if not os.path.exists(DIFFUSION_PATH) or os.path.getsize(DIFFUSION_PATH) < 2_000_000_000:
+        return False
+
+    print("[*] Dang toi uu hoa Diffusion checkpoint sang bfloat16 cho CPU (chi chay 1 lan)...")
+    try:
+        with zipfile.ZipFile(DIFFUSION_PATH, "r") as z:
+            pkl_bytes = z.read("archive/data.pkl")
+            offsets = {}
+            with open(DIFFUSION_PATH, "rb") as f:
+                for info in z.infolist():
+                    if info.filename.startswith("archive/data/"):
+                        f.seek(info.header_offset)
+                        lh = f.read(30)
+                        fn_len = int.from_bytes(lh[26:28], "little")
+                        ex_len = int.from_bytes(lh[28:30], "little")
+                        data_offset = info.header_offset + 30 + fn_len + ex_len
+                        key = info.filename.split("/")[-1]
+                        offsets[key] = (data_offset, info.file_size)
+
+            mmaps = {
+                k: np.memmap(DIFFUSION_PATH, dtype=np.uint8, mode="r", offset=off, shape=(sz,))
+                for k, (off, sz) in offsets.items()
+            }
+
+            class MemmapStorage:
+                def __init__(self, key, dtype, numel):
+                    self.key = key
+                    self.dtype = dtype
+                    self.numel = numel
+
+            def rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad, backward_hooks):
+                np_dtype = np.float32 if storage.dtype == torch.float32 else np.float16
+                itemsize = np.dtype(np_dtype).itemsize
+                byte_start = storage_offset * itemsize
+                total_elems = 1
+                for s in size:
+                    total_elems *= s
+                raw = mmaps[storage.key][byte_start : byte_start + total_elems * itemsize]
+                arr = np.frombuffer(raw.tobytes(), dtype=np_dtype).reshape(size)
+                return torch.from_numpy(arr.copy()).to(torch.bfloat16)
+
+            class CustomUnpickler(pickle.Unpickler):
+                def persistent_load(self, pid):
+                    _, stype, key, loc, numel = pid
+                    dtype = torch.float32 if "FloatStorage" in str(stype) else torch.float16
+                    return MemmapStorage(key, dtype, numel)
+
+                def find_class(self, module, name):
+                    if name == "_rebuild_tensor_v2":
+                        return rebuild_tensor_v2
+                    if module == "collections" and name == "OrderedDict":
+                        from collections import OrderedDict
+                        return OrderedDict
+                    return super().find_class(module, name)
+
+            state_dict = CustomUnpickler(io.BytesIO(pkl_bytes)).load()
+            tmp_path = DIFFUSION_BF16_PATH + ".tmp"
+            torch.save(state_dict, tmp_path)
+            del state_dict, mmaps
+            gc.collect()
+            if os.path.exists(DIFFUSION_BF16_PATH):
+                os.remove(DIFFUSION_BF16_PATH)
+            os.rename(tmp_path, DIFFUSION_BF16_PATH)
+            print(f"[+] Da tao thanh cong checkpoint bfloat16: {DIFFUSION_BF16_PATH}")
+            return True
+    except Exception as e:
+        print(f"[!] Loi chuyen doi bfloat16: {e}")
+        return False
+
+
+# ---------------------------------------------------------
+# 3. Khoi tao Diffusion Model
 # ---------------------------------------------------------
 diffusion_model = None
 diffusion_engine = None
@@ -83,16 +169,17 @@ def load_diffusion_if_ready():
     if DIFFUSION_READY:
         return True
 
-    # Kiem tra file ton tai va du dung luong (~2.1 GB)
-    if not os.path.exists(DIFFUSION_PATH):
-        return False
-    file_size = os.path.getsize(DIFFUSION_PATH)
-    if file_size < 2_000_000_000:
-        print(f"[!] File Diffusion chua tai xong ({file_size / (1024**2):.1f} MB / ~2109 MB).")
-        return False
+    if DEVICE == "cpu":
+        if not ensure_bf16_checkpoint():
+            return False
+        ckpt_to_load = DIFFUSION_BF16_PATH
+    else:
+        if not os.path.exists(DIFFUSION_PATH) or os.path.getsize(DIFFUSION_PATH) < 2_000_000_000:
+            return False
+        ckpt_to_load = DIFFUSION_PATH
 
     try:
-        print(f"[*] Dang nap Diffusion Model 256x256 (ddim20) len {DEVICE}...")
+        print(f"[*] Dang nap Diffusion Model ({DIFF_RES}x{DIFF_RES}, {DIFF_STEPS}) len {DEVICE}...")
         defaults = model_and_diffusion_defaults()
         defaults.update(
             dict(
@@ -109,18 +196,26 @@ def load_diffusion_if_ready():
                 resblock_updown=True,
                 use_fp16=(DEVICE == "cuda"),
                 use_scale_shift_norm=True,
-                timestep_respacing="ddim20",
+                timestep_respacing=DIFF_STEPS,
             )
         )
         with torch.device("meta"):
             model, diff = create_model_and_diffusion(**defaults)
-        sd = torch.load(DIFFUSION_PATH, map_location="cpu", mmap=True, weights_only=False)
+
+        sd = torch.load(ckpt_to_load, map_location="cpu", weights_only=False)
         model.load_state_dict(sd, assign=True)
-        if DEVICE == "cuda":
+        del sd
+        gc.collect()
+
+        if DEVICE == "cpu":
+            for m in model.modules():
+                if isinstance(m, torch.nn.GroupNorm):
+                    m.float()
+        else:
             model.to("cuda")
             model.convert_to_fp16()
-        model.eval()
 
+        model.eval()
         diffusion_model = model
         diffusion_engine = diff
         DIFFUSION_READY = True
@@ -143,8 +238,7 @@ transform_pipeline = transforms.Compose([
 ])
 
 
-def center_crop_arr(pil_image: Image.Image, image_size: int = 256) -> np.ndarray:
-    """Tien xu ly anh giong het guided_diffusion/image_datasets.py"""
+def center_crop_arr(pil_image: Image.Image, image_size: int) -> np.ndarray:
     while min(*pil_image.size) >= 2 * image_size:
         pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
 
@@ -172,14 +266,15 @@ def compute_dire_images(pil_image: Image.Image):
     if pil_image.mode != "RGB":
         pil_image = pil_image.convert("RGB")
 
-    arr = center_crop_arr(pil_image, 256)
+    arr = center_crop_arr(pil_image, DIFF_RES)
     arr_norm = arr.astype(np.float32) / 127.5 - 1.0
     imgs = torch.from_numpy(np.transpose(arr_norm, [2, 0, 1])).unsqueeze(0).to(DEVICE)
 
-    with torch.no_grad():
+    ctx = torch.autocast(device_type="cpu", dtype=torch.bfloat16) if DEVICE == "cpu" else torch.autocast(device_type="cuda", dtype=torch.float16)
+    with torch.no_grad(), ctx:
         latent = diffusion_engine.ddim_reverse_sample_loop(
             diffusion_model,
-            (1, 3, 256, 256),
+            (1, 3, DIFF_RES, DIFF_RES),
             noise=imgs,
             clip_denoised=True,
             model_kwargs={},
@@ -187,20 +282,21 @@ def compute_dire_images(pil_image: Image.Image):
         )
         recons = diffusion_engine.ddim_sample_loop(
             diffusion_model,
-            (1, 3, 256, 256),
+            (1, 3, DIFF_RES, DIFF_RES),
             noise=latent,
             clip_denoised=True,
             model_kwargs={},
             real_step=0,
         )
-        dire = torch.abs(imgs - recons)
 
-    recons_uint8 = ((recons + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)[0].permute(1, 2, 0).cpu().numpy()
+    dire = torch.abs(imgs.float() - recons.float())
+
+    recons_uint8 = ((recons.float() + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)[0].permute(1, 2, 0).cpu().numpy()
     dire_uint8 = (dire * 255.0 / 2.0).clamp(0, 255).to(torch.uint8)[0].permute(1, 2, 0).cpu().numpy()
 
-    cropped_orig_pil = Image.fromarray(arr.astype(np.uint8))
-    recons_pil = Image.fromarray(recons_uint8)
-    dire_pil = Image.fromarray(dire_uint8)
+    cropped_orig_pil = Image.fromarray(arr.astype(np.uint8)).resize((256, 256), Image.BICUBIC)
+    recons_pil = Image.fromarray(recons_uint8).resize((256, 256), Image.BICUBIC)
+    dire_pil = Image.fromarray(dire_uint8).resize((256, 256), Image.BICUBIC)
     return cropped_orig_pil, recons_pil, dire_pil
 
 
@@ -229,7 +325,7 @@ def classify_pil_image(img: Image.Image):
         "is_synthetic": is_synthetic,
         "confidence_pct": round(confidence * 100, 2),
         "device": DEVICE.upper(),
-        "arch": "ADM Diffusion (ddim20) + ResNet-50",
+        "arch": f"ADM Diffusion ({DIFF_STEPS}, {DIFF_RES}px) + ResNet-50",
     }
 
 
@@ -260,7 +356,7 @@ def api_predict():
     if file.filename == "":
         return jsonify({"error": "Tên tệp không hợp lệ"}), 400
 
-    mode = request.form.get("mode", "auto")  # auto | dire | direct
+    mode = request.form.get("mode", "auto")
 
     try:
         start_time = time.time()
@@ -274,15 +370,15 @@ def api_predict():
 
         if use_diffusion:
             if not load_diffusion_if_ready():
-                return jsonify({"error": "Mô hình Diffusion (256x256_diffusion_uncond.pt) chưa sẵn sàng."}), 503
+                return jsonify({"error": "Mô hình Diffusion chưa sẵn sàng."}), 503
             _, recons_pil, dire_pil = compute_dire_images(pil_image)
             recons_b64 = pil_to_base64(recons_pil)
             dire_b64 = pil_to_base64(dire_pil)
             result = classify_pil_image(dire_pil)
-            result["pipeline_mode"] = "Full 2-Step DIRE (DDIM20 + ResNet-50)"
+            result["pipeline_mode"] = f"Full 2-Step DIRE ({DIFF_STEPS.upper()} + ResNet-50)"
         else:
             result = classify_pil_image(pil_image)
-            result["pipeline_mode"] = "Direct Classifier Only (Chưa qua Diffusion)"
+            result["pipeline_mode"] = "Direct Classifier Only"
             result["arch"] = "ResNet-50 (Direct)"
 
         result["inference_time_ms"] = round((time.time() - start_time) * 1000, 2)
@@ -311,11 +407,10 @@ def api_sample(name):
         start_time = time.time()
         pil_image = Image.open(sample_map[name])
 
-        # Neu la anh dire co san thi phan loai truc tiep, nguoc lai chay full DIRE neu da san sang
         if name != "dire" and load_diffusion_if_ready():
             _, recons_pil, dire_pil = compute_dire_images(pil_image)
             result = classify_pil_image(dire_pil)
-            result["pipeline_mode"] = "Full 2-Step DIRE (DDIM20 + ResNet-50)"
+            result["pipeline_mode"] = f"Full 2-Step DIRE ({DIFF_STEPS.upper()} + ResNet-50)"
             result["recons_image"] = pil_to_base64(recons_pil)
             result["dire_image"] = pil_to_base64(dire_pil)
         else:
