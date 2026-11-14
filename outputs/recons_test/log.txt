@@ -1,0 +1,6 @@
+Logging to /content/drive/MyDrive/DIRE_Project/outputs/recons_test
+Namespace(images_dir='/content/drive/MyDrive/DIRE_Project/data/test_run', recons_dir='/content/drive/MyDrive/DIRE_Project/outputs/recons_test', dire_dir='/content/drive/MyDrive/DIRE_Project/outputs/dire_test', clip_denoised=True, num_samples=1, batch_size=1, use_ddim=True, model_path='/content/drive/MyDrive/DIRE_Project/checkpoints/256x256_diffusion_uncond.pt', real_step=0, continue_reverse=False, has_subfolder=False, image_size=256, num_channels=256, num_res_blocks=2, num_heads=4, num_heads_upsample=-1, num_head_channels=64, attention_resolutions='32,16,8', channel_mult='', dropout=0.1, class_cond=False, use_checkpoint=False, use_scale_shift_norm=True, resblock_updown=True, use_fp16=True, use_new_attention_order=False, learn_sigma=True, diffusion_steps=1000, noise_schedule='linear', timestep_respacing='ddim20', use_kl=False, predict_xstart=False, rescale_timesteps=False, rescale_learned_sigmas=False)
+have created model and diffusion
+have created data loader
+computing recons & DIRE ...
+dataset length: 1
