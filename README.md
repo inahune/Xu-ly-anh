@@ -11,7 +11,14 @@ Dự án triển khai mô hình **DIRE (DIffusion Reconstruction Error - ICCV 20
 - `data/` & `outputs/`: Dữ liệu ảnh mẫu và kết quả trích xuất DIRE thử nghiệm.
 - `checkpoints/`: Thư mục chứa trọng số mô hình (không push lên GitHub do vượt quá giới hạn 100MB).
 
-## 2. Tải trọng số mô hình (Bắt buộc trước khi chạy)
+## 2. Tải trọng số mô hình (Tự động hoặc Thủ công)
+**Cách 1 (Khuyên dùng - Tự động):**
+Chạy script sau (hoặc chạy trực tiếp `run_web.bat`), hệ thống sẽ tự kiểm tra và tải đủ 2 tệp trọng số vào `checkpoints/`:
+```bash
+python download_checkpoints.py
+```
+
+**Cách 2 (Thủ công):**
 Tải 2 tệp sau đặt vào thư mục `checkpoints/`:
 1. **Classifier (`lsun_adm.pth` ~270 MB):**
    `https://huggingface.co/dkarageo/sidbench/resolve/main/dire/lsun_adm.pth`
@@ -21,6 +28,8 @@ Tải 2 tệp sau đặt vào thư mục `checkpoints/`:
 ## 3. Hướng dẫn chạy Web
 ```bash
 pip install flask torch torchvision pillow numpy
+python download_checkpoints.py
 python app.py
 ```
+*(Trên Windows, có thể nhấp đúp trực tiếp vào `run_web.bat` để tự tải checkpoint và khởi động web).*
 Sau đó mở trình duyệt tại: `http://127.0.0.1:5000`
